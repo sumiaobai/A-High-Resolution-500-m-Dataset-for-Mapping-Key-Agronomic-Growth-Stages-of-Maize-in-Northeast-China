@@ -1,7 +1,7 @@
 # A-High-Resolution-500-m-Dataset-for-Mapping-Key-Agronomic-Growth-Stages-of-Maize-in-Northeast-China
 # Maize Phenology Mapping for Northeast China
 
-[![DOI]([10.5281/zenodo.17666835](https://zenodo.org/badge/DOI/10.5281/zenodo.17666835.svg)) 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17666835.svg)](https://doi.org/10.5281/zenodo.17666835)
 This repository contains the source code for generating the **High-Resolution (500-m) Maize Phenology Dataset (2001-2024)** for Northeast China, as described in the accompanying manuscript (under review).
 
 The dataset captures eight key agronomic growth stages of maize: emergence, three-leaf, seven-leaf, jointing, tasseling, silking, milk stage, and maturity.

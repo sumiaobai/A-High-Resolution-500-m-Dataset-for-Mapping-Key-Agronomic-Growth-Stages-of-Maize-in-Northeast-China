@@ -20,13 +20,14 @@ maize-phenology-nec/
 
 │   └── calculate_thermal_variables.py
 
+│   └── Feature_concate.py.py
 ├── models/                # Machine learning model scripts
 
 │   └── xgboost_phenology_model.py
 
-├── utils/                 # Utility functions
+│   └── xgboost_AARPD_Predicted.py 
 
-│   └── data_loader.py
+│   └── DOY interpolation calculation.py 
 
 ├── requirements.txt       # Python dependencies
 
@@ -36,9 +37,6 @@ maize-phenology-nec/
 
 ### Prerequisites
 *   Python 3.8+
-
-### Installation
-1.  Clone this repository:
 
 ### Basic Usage
 The code is structured for clarity. You can run the feature calculation and model scripts individually as needed.

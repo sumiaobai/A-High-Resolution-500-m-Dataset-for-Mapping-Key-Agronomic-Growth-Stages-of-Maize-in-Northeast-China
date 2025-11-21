@@ -1,0 +1,268 @@
+import os
+import numpy as np
+from osgeo import gdal
+from scipy.interpolate import interp1d
+import warnings
+import time
+
+warnings.filterwarnings('ignore')
+
+# Explicitly set GDAL exception handling
+gdal.UseExceptions()
+
+
+def read_tif(file_path):
+    """
+    Read TIFF file and return data array and dataset.
+    
+    Args:
+        file_path: Path to the TIFF file
+        
+    Returns:
+        Tuple of (data_array, dataset) or (None, None) if reading fails
+    """
+    try:
+        print(f"Reading file: {file_path}")
+        dataset = gdal.Open(file_path)
+        if dataset is None:
+            print(f"Error: Cannot open file: {file_path}")
+            return None, None
+
+        print(f"File contains {dataset.RasterCount} bands")
+        bands = []
+        for i in range(dataset.RasterCount):
+            band = dataset.GetRasterBand(i + 1).ReadAsArray()
+            bands.append(band)
+        print(f"Successfully read {len(bands)} bands")
+        return np.array(bands), dataset
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        return None, None
+
+
+def write_tif(file_path, data, geo_transform, projection):
+    """
+    Write data array to TIFF file.
+    
+    Args:
+        file_path: Path for output TIFF file
+        data: 2D numpy array to write
+        geo_transform: GeoTransform from source dataset
+        projection: Projection from source dataset
+        
+    Returns:
+        None
+    """
+    try:
+        # Ensure output directory exists
+        output_dir = os.path.dirname(file_path)
+        if output_dir and not os.path.exists(output_dir):
+            print(f"Creating output directory: {output_dir}")
+            os.makedirs(output_dir)
+
+        driver = gdal.GetDriverByName('GTiff')
+        rows, cols = data.shape
+        print(f"Creating TIFF file: {rows} rows x {cols} columns")
+        out_dataset = driver.Create(file_path, cols, rows, 1, gdal.GDT_Float32)
+        out_dataset.SetGeoTransform(geo_transform)
+        out_dataset.SetProjection(projection)
+        out_band = out_dataset.GetRasterBand(1)
+        out_band.WriteArray(data)
+        out_band.SetNoDataValue(-9999)  # Set NoData value
+        out_dataset.FlushCache()
+        out_dataset = None  # Ensure file is properly closed
+        print(f"File saved successfully: {file_path}")
+    except Exception as e:
+        print(f"Error writing file {file_path}: {e}")
+
+
+def doy_inter(ph, year, input_tif_1, input_tif_2, output_tif):
+    """
+    Perform DOY interpolation for a specific growth stage and year.
+    
+    Args:
+        ph: Growth stage name
+        year: Target year
+        input_tif_1: Path to first input TIFF (multi-band)
+        input_tif_2: Path to second input TIFF (single-band)
+        output_tif: Path for output TIFF
+        
+    Returns:
+        None
+    """
+    start_time = time.time()
+    print(f"Starting processing: {ph} {year}")
+
+    # Read first TIFF file (multi-band)
+    print("Reading first TIFF file...")
+    data_1, dataset_1 = read_tif(input_tif_1)
+    if data_1 is None or dataset_1 is None:
+        print(f"Error: Cannot read first TIFF file: {input_tif_1}")
+        return
+
+    num_bands = data_1.shape[0]
+    num_pairs = num_bands // 2
+    print(f"Detected {num_pairs} data pairs")
+
+    # Extract cumulative SSRD and DOY bands
+    cumulative_ssrd = data_1[0:num_bands:2]  # Odd-indexed bands
+    doy_band = data_1[1:num_bands:2]  # Even-indexed bands
+
+    # Read second TIFF file (single-band)
+    print("Reading second TIFF file...")
+    data_2, dataset_2 = read_tif(input_tif_2)
+    if data_2 is None or dataset_2 is None:
+        print(f"Error: Cannot read second TIFF file: {input_tif_2}")
+        return
+
+    cumulative_ssrd_2 = data_2[0]  # Single band (cumulative SSRD)
+
+    rows, cols = cumulative_ssrd.shape[1], cumulative_ssrd.shape[2]
+    print(f"Image dimensions: {rows} rows x {cols} columns")
+    result_doy = np.full((rows, cols), -9999, dtype=np.float32)  # Use -9999 as NoData value
+
+    # Vectorized processing - create valid mask
+    print("Calculating valid pixel mask...")
+    valid_mask = np.sum(~np.isnan(cumulative_ssrd) & (cumulative_ssrd != 0), axis=0) >= 2
+    valid_mask = valid_mask & ~np.isnan(cumulative_ssrd_2) & (cumulative_ssrd_2 != 0)
+
+    # Process only valid pixels
+    valid_indices = np.where(valid_mask)
+    valid_count = len(valid_indices[0])
+    total_pixels = rows * cols
+
+    print(f"Total pixels: {total_pixels}, Valid pixels: {valid_count} ({valid_count / total_pixels * 100:.2f}%)")
+
+    if valid_count == 0:
+        print("Warning: No valid pixels to process")
+        # Save empty result
+        write_tif(output_tif, result_doy, dataset_1.GetGeoTransform(), dataset_1.GetProjection())
+        return
+
+    # Prepare data for all valid pixels
+    print("Preparing interpolation data...")
+    all_ssrd = cumulative_ssrd[:, valid_indices[0], valid_indices[1]].T  # Transpose so each row is a pixel
+    all_doy = doy_band[:, valid_indices[0], valid_indices[1]].T
+    all_target = cumulative_ssrd_2[valid_indices]
+
+    # Initialize result array
+    interpolated_values = np.full(all_target.shape, -9999, dtype=np.float32)
+
+    # Process pixels in batch
+    print(f"Starting interpolation for {valid_count} pixels...")
+    processed_count = 0
+    progress_step = max(1, valid_count // 10)  # Show progress every 10%
+
+    for idx in range(valid_count):
+        ssrd_values = all_ssrd[idx]
+        doy_values = all_doy[idx]
+        target = all_target[idx]
+
+        # Remove invalid values
+        valid_pts = ~np.isnan(ssrd_values) & ~np.isnan(doy_values) & (ssrd_values != 0)
+        ssrd_values = ssrd_values[valid_pts]
+        doy_values = doy_values[valid_pts]
+
+        if len(ssrd_values) < 2:
+            continue
+
+        # Sort to ensure correct interpolation
+        sort_idx = np.argsort(ssrd_values)
+        ssrd_values = ssrd_values[sort_idx]
+        doy_values = doy_values[sort_idx]
+
+        try:
+            # Create interpolation function
+            interp_func = interp1d(ssrd_values, doy_values, kind='linear', bounds_error=False,
+                                   fill_value=(doy_values[0], doy_values[-1]))
+
+            # Interpolate
+            interpolated_value = interp_func(target)
+            interpolated_values[idx] = interpolated_value
+        except Exception as e:
+            interpolated_values[idx] = -9999
+            if idx < 10:  # Only print first 10 errors to avoid too much output
+                print(f"Interpolation error at pixel {idx}: {e}")
+
+        # Show progress
+        processed_count += 1
+        if processed_count % progress_step == 0:
+            progress = processed_count / valid_count * 100
+            print(f"Processing progress: {progress:.1f}% ({processed_count}/{valid_count})")
+
+    # Put results back to correct positions
+    print("Writing results back to image...")
+    result_doy[valid_indices] = interpolated_values
+
+    # Calculate success rate of interpolation
+    success_count = np.sum(interpolated_values != -9999)
+    success_rate = success_count / valid_count * 100 if valid_count > 0 else 0
+    print(f"Successfully interpolated pixels: {success_count}/{valid_count} ({success_rate:.2f}%)")
+
+    # Save result
+    print("Saving result file...")
+    write_tif(output_tif, result_doy, dataset_1.GetGeoTransform(), dataset_1.GetProjection())
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Processing completed: Time elapsed {elapsed_time:.2f} seconds")
+    print(f"Interpolated DOY saved to: {output_tif}")
+    print("-" * 50)
+
+
+def main():
+    """
+    Main function to process DOY interpolation for multiple states, years, and growth stages.
+    
+    TODO: Set your input and output path templates here
+    """
+    # TODO: Set your input and output path templates here
+    input_tif_1_template = ""  # 
+    input_tif_2_template = ""  #
+    output_tif_template = ""   # 
+    
+    if not input_tif_1_template or not input_tif_2_template or not output_tif_template:
+        print("Please set input_tif_1_template, input_tif_2_template, and output_tif_template in main() function")
+        return
+    
+    # States to process
+    states = ['HLJ', 'JL', 'LN', 'WSM']
+    
+    # Growth stages to process
+    ph_stage = ['emergence', 'three-leaf', 'seven-leaf', 'jointing', 'tasseling', 'flowering', 'silking', 'milk-stage', 'maturity']
+    
+    # Years to process
+    years = [2020]  # Example: range(2020, 2021) for single year
+    
+    total_start_time = time.time()
+    total_tasks = len(states) * len(years) * len(ph_stage)
+    completed_tasks = 0
+
+    for state in states:
+        for year in years:
+            for ph in ph_stage:
+                completed_tasks += 1
+                print(f"Task {completed_tasks}/{total_tasks}: {state} {year} {ph}")
+
+                # Format paths using templates
+                input_tif_1 = input_tif_1_template.format(year=year, state=state)
+                input_tif_2 = input_tif_2_template.format(year=year, state=state, ph=ph)
+                output_tif = output_tif_template.format(year=year, state=state, ph=ph)
+
+                # Check if input files exist
+                if not os.path.exists(input_tif_1):
+                    print(f"Error: File does not exist: {input_tif_1}")
+                    continue
+                if not os.path.exists(input_tif_2):
+                    print(f"Error: File does not exist: {input_tif_2}")
+                    continue
+
+                doy_inter(ph, year, input_tif_1, input_tif_2, output_tif)
+
+    total_end_time = time.time()
+    total_elapsed_time = total_end_time - total_start_time
+    print(f"All tasks completed! Total time: {total_elapsed_time:.2f} seconds")
+
+
+if __name__ == '__main__':
+    main()
